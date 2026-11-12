@@ -1,0 +1,60 @@
+1. Inventario de esquemas de todas las tablas (para P-10 y para hallar la tabla maestra)
+python
+%spark.pyspark
+from pyspark.sql import functions as F, Row
+base = "/datalake/spbcifin"
+jvm = spark._jvm
+fs = jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+filas = []
+for st in fs.listStatus(jvm.org.apache.hadoop.fs.Path(base)):
+    ruta = st.getPath().toString(); nombre = st.getPath().getName()
+    es_delta = fs.exists(jvm.org.apache.hadoop.fs.Path(ruta + "/_delta_log"))
+    try:
+        df = spark.read.format("delta" if es_delta else "parquet").load(ruta)
+        for c, t in df.dtypes:
+            filas.append(Row(tabla=nombre, delta=es_delta, columna=c, tipo=t))
+    except Exception as e:
+        filas.append(Row(tabla=nombre, delta=es_delta, columna="ERROR", tipo=str(e)[:80]))
+inv = spark.createDataFrame(filas)
+inv.coalesce(1).write.mode("overwrite").option("header", True).option("sep", "|").csv("/user/jmuneva/inventario_esquemas")
+inv.groupBy("tabla", "delta").agg(F.count("*").alias("n_columnas")).orderBy("tabla").show(200, False)
+
+Luego bájalo como un solo archivo y mándamelo. Ese archivo es lo más útil de todo:
+
+%sh
+hdfs dfs -getmerge /user/jmuneva/inventario_esquemas /tmp/inventario_esquemas.csv && wc -l /tmp/inventario_esquemas.csv
+2. ¿Dónde están entidad, número de obligación, tipo de reporte y línea?
+python
+%spark.pyspark
+patron = "(?i)ENTIDAD|SUSCRIPTOR|OBLIGACION|NUMERO_CUENTA|TIPO_REPORTE|LINEA|MODALIDAD|TERCERO|IDENTIFICACION|CALIDAD|SECUENCIA|FECHA_CORTE"
+inv.filter(F.col("columna").rlike(patron)).orderBy("columna", "tabla").show(300, False)
+3. ¿Existen ya las tablas PRM_* o algo de parámetros en Hive?
+python
+%spark.pyspark
+spark.sql("SHOW DATABASES").show(100, False)
+for db in [r[0] for r in spark.sql("SHOW DATABASES").collect()]:
+    t = spark.sql(f"SHOW TABLES IN {db}").filter(F.col("tableName").rlike("(?i)prm|param|valores|soc_fuentes|monitor"))
+    if t.count() > 0: t.show(50, False)
+4. Dominios oficiales (P-05: estructura de VALORES_TABLA_PARAMETRO)
+python
+%spark.pyspark
+vt = spark.read.format("delta").load(base + "/daily_valores_tabla_parametros.parquet")
+vt.printSchema()
+vt.show(20, False)
+
+Cuando vea las columnas te paso el query que busca el dominio de estados de obligación.
+
+5. Perfil de la fuente del paquete Real: cortes por entidad y llaves
+
+Cambia COL_ENTIDAD por el nombre real que salga en la celda 2. Si ninguno aplica, déjalo en None.
+
+python
+%spark.pyspark
+COL_ENTIDAD = None   # ej. "CODIGO_ENTIDAD"
+df = spark.read.format("delta").load(base + "/detalles_sector_real.parquet")
+print("registros:", df.count())
+print("llave SECUENCIA_SECTOR_REAL+CONSECUTIVO única?:",
+      df.count() == df.select("SECUENCIA_SECTOR_REAL","CONSECUTIVO").distinct().count())
+if COL_ENTIDAD:
+    df.groupBy(COL_ENTIDAD).agg(F.max("FECHA_CORTE").alias("ult_corte"), F.count("*").alias("n")) \
+      .orderBy(F.desc("n")).show(20, False)
