@@ -1,0 +1,393 @@
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%md
+# # Motor de Indicadores — Data Monitoring (prototipo v0.1)
+# Motor genérico del punto 6 del BRD. **Los indicadores son configuración** (modelo de parametrización V1.5)
+# y **el comportamiento es código** (catálogo Anexo A, DEC-01).
+#
+# | Celda | Contenido |
+# |---|---|
+# | 1 | Configuración de la ejecución |
+# | 2 | Catálogo en código (Anexo A): 52 indicadores |
+# | 3 | Parámetros PRM_* (réplica V1.5 con valores del BRD, solo paquete Real) |
+# | 4 | Validaciones: catálogo ↔ PRM_INDICADOR y PRM_VARIABLE ↔ esquema real |
+# | 5 | Funciones del motor: normalización, condiciones (OR de AND), umbral, M11 |
+# | 6 | Fuente → modelo lógico (PRM_VARIABLE) |
+# | 7 | Cálculo de indicadores y Fact_Regla |
+# | 8 | Hallazgo: códigos de estado sin normalizar |
+# | 9 | fact_REGISTROAFECTADO (detalle para el botón VER del tablero) |
+# | 10 | Opcional: simular corte anterior (solo demo) |
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 1. CONFIGURACIÓN DE LA EJECUCIÓN =====================
+from pyspark.sql import functions as F, Window
+from collections import namedtuple
+import datetime, uuid
+
+BASE          = "/datalake/spbcifin"
+FORMATO_FUENTE = "delta"                       # tablas de spbcifin son Delta
+RUTA_SALIDA   = "/user/jmuneva/data_monitoring" # Fact_Regla, fact_REGISTROAFECTADO
+FORMATO_SALIDA = "delta"
+COD_PAQUETE   = "RC"                           # Real Comercio (piloto)
+COL_ENTIDAD   = None    # PENDIENTE: columna de entidad (tabla maestra). None = toda la tabla como una entidad
+CORTE_ACTUAL  = None    # 'yyyyMM'. None = último corte presente en la fuente (equivale a mes ejecución - X_MESES_EJECUCION)
+ID_EJECUCION  = datetime.datetime.now().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:6]
+
+print("Ejecución:", ID_EJECUCION, "| paquete:", COD_PAQUETE, "| salida:", RUTA_SALIDA)
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 2. CATÁLOGO EN CÓDIGO (ANEXO A, DEC-01) =====================
+# Inmutable: un cambio aquí es un cambio de desarrollo (CB-06). No se carga en base de datos.
+Ind = namedtuple("Ind", "codigo operador nivel sentido corte_anterior")
+_c = []
+def _add(cods, op, niv, sen, ant):
+    for c in cods: _c.append(Ind(c, op, niv, sen, ant))
+
+_add(["VOL001","VOL002","VOL003","VOL004","VOL006","VOL007"], "ABS_GE","ENTIDAD","PORCENTAJE_BILATERAL", True)
+_add(["VOL005"],                       "GE",    "ENTIDAD","PORCENTAJE_SUPERIOR", False)
+_add(["FUN001"],                       "GE",    "ENTIDAD","PORCENTAJE_SUPERIOR", True)   # P-31 / P-56
+_add(["FUN002"],                       "GE",    "ENTIDAD","PORCENTAJE_SUPERIOR", False)
+_add(["FUN003"],                       "GT",    "ELEMENTO","NUMERICO_SUPERIOR",  False)
+_add(["FUN004"],                       "GT",    "ELEMENTO","NUMERICO_SUPERIOR",  True)
+_add(["MON00%d" % i for i in range(1,7)], "ABS_GE","ENTIDAD","PORCENTAJE_BILATERAL", True)
+_add(["MON007","MON008","MON009","MON010","MON011"], "GE","ENTIDAD","PORCENTAJE_SUPERIOR", False)
+_add(["EST001","EST002"],              "GE",    "ENTIDAD","NUMERICO_SUPERIOR",   False)
+_add(["SOC00%d" % i for i in range(1,5)] + ["SOC10%d" % i for i in range(1,7)] + ["SOC20%d" % i for i in range(1,7)],
+                                       "GT",    "ELEMENTO","NUMERICO_SUPERIOR",  False)
+_add(["SOC301"],                       "GE",    "ENTIDAD","NUMERICO_SUPERIOR",   False)
+_add(["PER00%d" % i for i in range(1,6)], "GE", "ENTIDAD","NUMERICO_SUPERIOR",   False)
+_add(["CON001","CON002","CON003"],     "GE",    "ENTIDAD","NUMERICO_SUPERIOR",   False)
+_add(["VAL001","VAL002","VAL003"],     "EVENTO","EVENTO", None,                  False)
+
+CATALOGO = {i.codigo: i for i in _c}
+assert len(CATALOGO) == 52, len(CATALOGO)
+print("Catálogo en código:", len(CATALOGO), "indicadores")
+print("Requieren corte anterior:", sorted(k for k, v in CATALOGO.items() if v.corte_anterior))
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 3. PARÁMETROS PRM_* (réplica del modelo V1.5) =====================
+# Valores del BRD / ejemplos del DDD para el paquete Real. En producción se reemplaza por la
+# lectura de las PRM_* reales (rol PRM_LECTURA) — misma estructura, el motor no cambia.
+TABLA_RC = BASE + "/detalles_sector_real.parquet"
+
+prm_clasificacion = spark.createDataFrame([
+    (1, "PEQUENA", 0,       100000,  85.0),
+    (2, "MEDIANA", 100001,  1000000, 90.0),
+    (3, "GRANDE",  1000001, None,    95.0)],
+    "cod_clasificacion int, nombre string, volumen_min long, volumen_max long, meta_ratio double")
+
+# (cod_indicador, cod_paquete, tipo_reporte, umbral_pequena, umbral_mediana, umbral_grande, umbral_elemento)
+# VOL001 y MON007 = 15/10/5 según el DDD. Los demás: valores DEMO hasta cargar el BRD completo.
+prm_indicador_paquete = spark.createDataFrame([
+    ("VOL001","RC","TOTAL",15.0,10.0,5.0,None),
+    ("VOL002","RC","TOTAL",15.0,10.0,5.0,None),
+    ("VOL005","RC","TOTAL",15.0,10.0,5.0,None),
+    ("MON001","RC","TOTAL",15.0,10.0,5.0,None),
+    ("MON007","RC","TOTAL",15.0,10.0,5.0,None),
+    ("MON009","RC","TOTAL",15.0,10.0,5.0,None),
+    ("MON010","RC","TOTAL",15.0,10.0,5.0,None),
+    ("EST001","RC","TOTAL", 1.0, 1.0,1.0,None)],
+    "cod_indicador string, cod_paquete string, tipo_reporte string, umbral_pequena double, "
+    "umbral_mediana double, umbral_grande double, umbral_elemento double")
+
+# PRM_VARIABLE: variable lógica -> columna física (P-10). columna_fisica admite expresión (llaves compuestas, P-29).
+prm_variable = spark.createDataFrame([
+    ("RC","ID_OBLIGACION",    "CODIGO",    TABLA_RC, "concat_ws('-', SECUENCIA_SECTOR_REAL, CONSECUTIVO)", 1),
+    ("RC","ESTADO",           "CODIGO",    TABLA_RC, "ESTADO_OBLIGACION", 1),
+    ("RC","ESTADO_REGISTRO",  "CODIGO",    TABLA_RC, "ESTADO_REGISTRO",   0),
+    ("RC","EDAD_MORA",        "NUMERICO",  TABLA_RC, "EDAD_MORA",         0),
+    ("RC","VALOR_MORA",       "MONETARIO", TABLA_RC, "VALOR_MORA",        0),
+    ("RC","VALOR_SALDO",      "MONETARIO", TABLA_RC, "SALDO",             1),
+    ("RC","VALOR_CUOTA",      "MONETARIO", TABLA_RC, "VALOR_CUOTA",       0),
+    ("RC","VALOR_REAL_PAGADO","MONETARIO", TABLA_RC, "VALOR_REAL_PAGADO", 0),
+    ("RC","FECHA_CORTE",      "FECHA",     TABLA_RC, "FECHA_CORTE",       1)],
+    "cod_paquete string, nombre_variable string, tipo_variable string, tabla_fisica string, "
+    "columna_fisica string, valida_nulo int")
+
+# PRM_CONDICION: estados abiertos de Real (muestra del DDD 6.6.1, BRD Tabla 14). OR entre reglas, AND dentro de cada regla.
+prm_condicion = spark.createDataFrame([
+    ("EST-AB-RC-01",1,"ESTADO_ABIERTO","*","RC","ESTADO","IN","1,4,6,8,9,10,11,12,13,14"),
+    ("EST-AB-RC-02",1,"ESTADO_ABIERTO","*","RC","ESTADO","IN","3,5")],
+    "cod_regla string, secuencia int, tipo_regla string, cod_indicador string, cod_paquete string, "
+    "nombre_variable string, operador string, valores string")
+
+# PRM_GENERAL
+prm_general = {"REG_ACTIVO": ["A00S"],   # PENDIENTE: ¿A57S, A60S, A61S, A90S cuentan como activos?
+               "X_MESES_EJECUCION": 1}
+
+for n, d in [("PRM_CLASIFICACION", prm_clasificacion), ("PRM_INDICADOR_PAQUETE", prm_indicador_paquete),
+             ("PRM_VARIABLE", prm_variable), ("PRM_CONDICION", prm_condicion)]:
+    print("==", n); d.show(truncate=False)
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 4. VALIDACIONES DE CONFIGURACIÓN =====================
+errores_config = []
+
+# 4.1 Catálogo en código <-> PRM_INDICADOR_PAQUETE (Anexo A, requisito 1 y 2)
+for r in prm_indicador_paquete.collect():
+    if r.cod_indicador not in CATALOGO:
+        errores_config.append((r.cod_indicador, r.cod_paquete, "Indicador sin definición en el catálogo en código"))
+    elif CATALOGO[r.cod_indicador].nivel == "ELEMENTO" and r.umbral_elemento is None:
+        errores_config.append((r.cod_indicador, r.cod_paquete, "Nivel ELEMENTO sin umbral_elemento (CP-PRM-003)"))
+
+# 4.2 PRM_VARIABLE <-> esquema real de la fuente
+fuente_raw = spark.read.format(FORMATO_FUENTE).load(TABLA_RC)
+variables_ok = {}
+for r in prm_variable.filter(F.col("cod_paquete") == COD_PAQUETE).collect():
+    try:
+        fuente_raw.select(F.expr(r.columna_fisica)).schema   # fuerza el análisis: falla si la columna no existe
+        variables_ok[r.nombre_variable] = r
+        print("OK   ", r.nombre_variable.ljust(18), "->", r.columna_fisica)
+    except Exception as e:
+        errores_config.append(("*", COD_PAQUETE, "Variable %s: columna '%s' no existe" % (r.nombre_variable, r.columna_fisica)))
+        print("ERROR", r.nombre_variable.ljust(18), "->", r.columna_fisica)
+
+print("\nErrores de configuración:", len(errores_config))
+for e in errores_config: print("  ", e)
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 5. FUNCIONES DEL MOTOR =====================
+import functools
+
+def normalizar(col, tipo):
+    """CODIGO numérico: '01' y '1' quedan iguales (hallazgo calidad). NUMERICO/MONETARIO: decimal."""
+    if tipo in ("NUMERICO", "MONETARIO"):
+        return F.trim(col.cast("string")).cast("decimal(38,4)")
+    c = F.trim(col.cast("string"))
+    return F.when(c.rlike("^[0-9]+$"), F.regexp_replace(c, "^0+(?=.)", "")).otherwise(c)
+
+def _norm_valor(v):
+    v = v.strip()
+    return (v.lstrip("0") or "0") if v.isdigit() else v
+
+def expr_conjunto(tipo_regla, cod_indicador="*", paquete=COD_PAQUETE):
+    """DDD 5.7.3: (c11 AND c12 ...) OR (c21 AND ...). Nulo no cumple ninguna condición."""
+    filas = (prm_condicion.filter((F.col("cod_paquete") == paquete) & (F.col("tipo_regla") == tipo_regla) &
+                                  (F.col("cod_indicador") == cod_indicador)).orderBy("cod_regla", "secuencia").collect())
+    reglas = {}
+    for r in filas:
+        tipo = variables_ok[r.nombre_variable].tipo_variable
+        col = F.col(r.nombre_variable)                     # ya normalizada en el modelo lógico
+        vals = [_norm_valor(v) for v in r.valores.split(",")]
+        if   r.operador == "IN":     e = col.isin(vals)
+        elif r.operador == "NOT_IN": e = ~col.isin(vals)
+        elif r.operador == "GT":     e = col > float(vals[0])
+        elif r.operador == "LT":     e = col < float(vals[0])
+        reglas.setdefault(r.cod_regla, []).append(col.isNotNull() & e)
+    if not reglas:
+        return None
+    return functools.reduce(lambda a, b: a | b, [functools.reduce(lambda a, b: a & b, es) for es in reglas.values()])
+
+def corte_menos(corte, n=1):
+    y, m = int(corte[:4]), int(corte[4:])
+    t = y * 12 + (m - 1) - n
+    return "%04d%02d" % (t // 12, t % 12 + 1)
+
+def evaluar(df):
+    """Aplica operador del catálogo, umbral por clasificación y M11 (DDD 5.7.1, Anexo A)."""
+    cat = spark.createDataFrame([(k, v.operador, v.nivel, v.sentido) for k, v in CATALOGO.items()],
+                                "cod_indicador string, operador string, nivel string, sentido string")
+    d = (df.join(cat, "cod_indicador")
+           .join(prm_indicador_paquete, ["cod_indicador", "cod_paquete"])
+           .withColumn("umbral_aplicado", F.when(F.col("clasificacion_corte") == 1, F.col("umbral_pequena"))
+                                           .when(F.col("clasificacion_corte") == 2, F.col("umbral_mediana"))
+                                           .otherwise(F.col("umbral_grande"))))
+    v, u = F.col("valor_indicador"), F.col("umbral_aplicado")
+    d = d.withColumn("supera_umbral",
+            F.when(v.isNull(), F.lit(None))
+             .when(F.col("operador") == "ABS_GE", F.abs(v) >= u)
+             .when(F.col("operador") == "GE", v >= u))
+    d = d.withColumn("desviacion_umbral",
+            F.when(F.col("sentido") == "PORCENTAJE_BILATERAL", F.abs(v) - u)
+             .when(F.col("sentido") == "PORCENTAJE_SUPERIOR", v - u)
+             .when(F.col("sentido") == "NUMERICO_SUPERIOR", F.col("registros_afectados") - u))
+    return d.drop("umbral_pequena", "umbral_mediana", "umbral_grande", "operador", "nivel")
+
+print("Funciones del motor cargadas")
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 6. FUENTE -> MODELO LÓGICO =====================
+# El motor solo conoce variables lógicas (Anexo B). PRM_VARIABLE traduce a columnas físicas.
+sel = [normalizar(F.expr(r.columna_fisica), r.tipo_variable).alias(n) if r.tipo_variable in ("CODIGO", "NUMERICO", "MONETARIO")
+       else F.expr(r.columna_fisica).alias(n) for n, r in variables_ok.items()]
+sel.append((F.col(COL_ENTIDAD).cast("string") if COL_ENTIDAD else F.lit("TODAS")).alias("cod_entidad"))
+sel.append(F.date_format(F.to_date(F.expr(variables_ok["FECHA_CORTE"].columna_fisica)), "yyyyMM").alias("corte_registro"))
+
+base = fuente_raw.select(*sel).filter(F.col("ESTADO_REGISTRO").isin(prm_general["REG_ACTIVO"]))
+cond_abierto = expr_conjunto("ESTADO_ABIERTO")
+base = base.withColumn("es_abierto", F.coalesce(cond_abierto, F.lit(False))).cache()
+
+if CORTE_ACTUAL is None:
+    CORTE_ACTUAL = base.agg(F.max("corte_registro")).first()[0]
+CORTE_ANTERIOR = corte_menos(CORTE_ACTUAL)
+print("Corte actual:", CORTE_ACTUAL, "| corte de comparación:", CORTE_ANTERIOR)
+print("Registros activos en la fuente:", base.count())
+base.limit(5).show(truncate=False)
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 7. CÁLCULO DE INDICADORES -> FACT_REGLA =====================
+act = base.filter(F.col("corte_registro") == CORTE_ACTUAL)            # registros del corte actual
+abiertas_act = act.filter("es_abierto")
+abiertas_todas = base.filter("es_abierto")                             # para VOL005 (no actualizadas)
+g = ["cod_entidad"]
+
+def ind(df, codigo, evaluados, afectados, medida=None, pct=True):
+    """Cada indicador = una agregación por entidad. pct=True -> valor = afectados/evaluados*100."""
+    medida = (medida if medida is not None else afectados).cast("double")
+    out = df.groupBy(*g).agg(evaluados.alias("registros_evaluados"), afectados.alias("registros_afectados"),
+                             medida.alias("medida_actual"))
+    valor = (F.col("registros_afectados") / F.col("registros_evaluados") * 100) if pct else F.col("registros_afectados")
+    return out.withColumn("cod_indicador", F.lit(codigo)).withColumn("valor_indicador", valor.cast("double"))
+
+def si(c):  # cuenta registros que cumplen c
+    return F.sum(F.when(c, 1).otherwise(0))
+
+n = F.count(F.lit(1))
+resultados = [
+    # --- Indicadores SIN corte anterior: resultado real hoy ---
+    ind(abiertas_todas, "VOL005", n, si(F.col("corte_registro") < CORTE_ACTUAL)),
+    ind(abiertas_act,   "MON007", n, si(F.col("VALOR_SALDO") == 0)),
+    ind(abiertas_act,   "MON009", n, si(F.col("VALOR_CUOTA") == 0)),
+    ind(abiertas_act,   "MON010", n, si(F.col("VALOR_REAL_PAGADO") == 0)),
+    ind(act,            "EST001", n, si(functools.reduce(lambda a, b: a | b,
+                                    [F.col(k).isNull() for k, r in variables_ok.items() if r.valida_nulo == 1])), pct=False),
+    # --- Indicadores CON corte anterior: medida actual; el % sale de comparar con el corte anterior ---
+    ind(abiertas_act,   "VOL001", n, n),
+    ind(abiertas_act,   "VOL002", n, si((F.col("EDAD_MORA") > 0) & (F.col("VALOR_MORA") > 0))),   # criterio fijo P-38
+    ind(abiertas_act,   "MON001", n, n, medida=F.sum("VALOR_SALDO").cast("double")),
+]
+fact = functools.reduce(lambda a, b: a.unionByName(b), resultados).withColumn("cod_paquete", F.lit(COD_PAQUETE))
+
+# Corte anterior: lo guarda el propio motor (la fuente se reescribe cada noche y no tiene historia)
+def existe(ruta):
+    p = spark._jvm.org.apache.hadoop.fs.Path(ruta)
+    return p.getFileSystem(spark._jsc.hadoopConfiguration()).exists(p)
+
+RUTA_FACT = RUTA_SALIDA + "/fact_regla"
+if existe(RUTA_FACT):
+    ant = (spark.read.format(FORMATO_SALIDA).load(RUTA_FACT)
+           .filter(F.col("id_corte") == CORTE_ANTERIOR)
+           .select("cod_entidad", "cod_paquete", "cod_indicador", F.col("medida_actual").alias("medida_anterior")))
+else:
+    ant = spark.createDataFrame([], "cod_entidad string, cod_paquete string, cod_indicador string, medida_anterior double")
+fact = fact.join(ant, ["cod_entidad", "cod_paquete", "cod_indicador"], "left")
+
+usa_ant = [k for k, v in CATALOGO.items() if v.corte_anterior]
+es_var = F.col("cod_indicador").isin(usa_ant)
+fact = (fact.withColumn("medida_anterior", F.when(es_var, F.col("medida_anterior")))
+            .withColumn("valor_indicador", F.when(es_var,
+                 F.when(F.col("medida_anterior") > 0,
+                        (F.col("medida_actual") - F.col("medida_anterior")) / F.col("medida_anterior") * 100))
+                 .otherwise(F.col("valor_indicador")))
+            .withColumn("estado_evaluacion", F.when(es_var & F.col("medida_anterior").isNull(), "LINEA_BASE_SIN_CORTE_ANTERIOR")
+                                              .when(es_var & (F.col("medida_anterior") == 0), "ERROR_CARGUE_ANTERIOR")
+                                              .otherwise("EVALUADO")))
+
+# Clasificación de la entidad por volumen del corte (Q-01)
+vol = act.groupBy(*g).agg(F.count(F.lit(1)).alias("volumen_registros"))
+cla = prm_clasificacion.select("cod_clasificacion", "volumen_min", "volumen_max", "meta_ratio")
+vol = (vol.join(F.broadcast(cla), (F.col("volumen_registros") >= F.col("volumen_min")) &
+               (F.col("volumen_max").isNull() | (F.col("volumen_registros") <= F.col("volumen_max"))))
+          .select(*g, "volumen_registros", F.col("cod_clasificacion").alias("clasificacion_corte"), "meta_ratio"))
+
+fact_regla = (evaluar(fact.join(vol, g, "left"))
+              .withColumn("id_corte", F.lit(CORTE_ACTUAL))
+              .withColumn("id_ejecucion", F.lit(ID_EJECUCION))
+              .select("id_corte", "cod_entidad", "cod_paquete", "cod_indicador", "clasificacion_corte", "meta_ratio",
+                      "volumen_registros", "registros_evaluados", "registros_afectados", "medida_actual",
+                      "medida_anterior", F.round("valor_indicador", 4).alias("valor_indicador"), "umbral_aplicado",
+                      "supera_umbral", F.round("desviacion_umbral", 4).alias("desviacion_umbral"), "sentido",
+                      "estado_evaluacion", "id_ejecucion"))
+
+def escribir(df, ruta):
+    w = df.write.format(FORMATO_SALIDA).partitionBy("id_corte")
+    if existe(ruta) and FORMATO_SALIDA == "delta":
+        w.mode("overwrite").option("replaceWhere", "id_corte = '%s'" % CORTE_ACTUAL).save(ruta)
+    elif existe(ruta):
+        spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic"); w.mode("overwrite").save(ruta)
+    else:
+        w.mode("overwrite").save(ruta)
+
+escribir(fact_regla, RUTA_FACT)
+z_fact = fact_regla.orderBy("cod_indicador")
+z_fact.show(50, truncate=False)
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 8. HALLAZGO: CÓDIGOS DE ESTADO SIN NORMALIZAR =====================
+# DDD 5.7.3: IN sobre CODIGO compara como texto. Sin normalizar, '01' no coincide con '1'.
+col_est = variables_ok["ESTADO"].columna_fisica
+vals = sorted({v.strip() for r in prm_condicion.filter("tipo_regla = 'ESTADO_ABIERTO'").collect() for v in r.valores.split(",")})
+raw = fuente_raw.filter(F.col("ESTADO_REGISTRO").isin(prm_general["REG_ACTIVO"]))
+sin_norm = raw.filter(F.trim(F.col(col_est)).isin(vals)).count()
+con_norm = base.filter("es_abierto").count()
+print("Obligaciones abiertas SIN normalizar códigos:", sin_norm)
+print("Obligaciones abiertas CON normalización     :", con_norm)
+print("Registros que se perderían sin normalizar   :", con_norm - sin_norm)
+
+(raw.withColumn("estado_normalizado", normalizar(F.col(col_est), "CODIGO"))
+    .groupBy("estado_normalizado").agg(F.collect_set(F.trim(F.col(col_est))).alias("formatos_en_fuente"),
+                                       F.count(F.lit(1)).alias("registros"))
+    .filter(F.size("formatos_en_fuente") > 1).orderBy("estado_normalizado").show(truncate=False))
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 9. FACT_REGISTROAFECTADO (detalle del botón VER) =====================
+criterios = {
+    "MON007": (abiertas_act,   F.col("VALOR_SALDO") == 0,              "VALOR_SALDO",       "El campo evaluado es cero"),
+    "MON009": (abiertas_act,   F.col("VALOR_CUOTA") == 0,              "VALOR_CUOTA",       "El campo evaluado es cero"),
+    "MON010": (abiertas_act,   F.col("VALOR_REAL_PAGADO") == 0,        "VALOR_REAL_PAGADO", "El campo evaluado es cero"),
+    "VOL005": (abiertas_todas, F.col("corte_registro") < CORTE_ACTUAL, "FECHA_CORTE",       "Obligación abierta no actualizada en el corte"),
+}
+detalle = functools.reduce(lambda a, b: a.unionByName(b), [
+    df.filter(c).select(F.lit(CORTE_ACTUAL).alias("id_corte"), "cod_entidad", F.lit(COD_PAQUETE).alias("cod_paquete"),
+                        F.lit(k).alias("cod_indicador"), F.col("ID_OBLIGACION").alias("llave_registro"),
+                        F.lit(var).alias("campos_afectados"), F.col(var).cast("string").alias("valor_registro"),
+                        F.lit(txt).alias("criterio_validacion"), F.lit(ID_EJECUCION).alias("id_ejecucion"))
+    for k, (df, c, var, txt) in criterios.items()])
+
+escribir(detalle, RUTA_SALIDA + "/fact_registroafectado")
+detalle.groupBy("cod_indicador").count().orderBy("cod_indicador").show()
+detalle.show(10, truncate=False)
+
+
+
+#################### NUEVA CELDA ZEPPELIN ####################
+%spark.pyspark
+# ===================== 10. OPCIONAL — SIMULAR CORTE ANTERIOR (SOLO DEMO) =====================
+# Crea un corte anterior ficticio (medida = 85% de la actual) para mostrar cómo se evalúan VOL001/VOL002/MON001.
+# Después vuelva a ejecutar la celda 7. Borrar con: hdfs dfs -rm -r <RUTA_SALIDA>/fact_regla/id_corte=<CORTE_ANTERIOR>
+SIMULAR = False
+if SIMULAR:
+    sim = (fact_regla.filter(F.col("cod_indicador").isin(usa_ant))
+           .withColumn("medida_actual", F.col("medida_actual") * 0.85)
+           .withColumn("id_corte", F.lit(CORTE_ANTERIOR)).withColumn("id_ejecucion", F.lit("SIMULADO")))
+    _c_actual = CORTE_ACTUAL; CORTE_ACTUAL = CORTE_ANTERIOR
+    escribir(sim, RUTA_FACT); CORTE_ACTUAL = _c_actual
+    print("Corte anterior simulado escrito:", CORTE_ANTERIOR, "-> vuelva a ejecutar la celda 7")
